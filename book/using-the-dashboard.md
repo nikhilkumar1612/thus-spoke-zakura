@@ -216,6 +216,13 @@ not exposed as the user-account transfer shown by Recent activity. The
 server's activity record knows the development account IDs, while the
 Explorer follows the public chain.
 
+Recent activity can be filtered by development account, activity kind, and
+status. The filters combine. The dashboard shows 10 entries by default; choose
+10, 25, 50, or 100 and use the page controls to move through older activity.
+**Last** loads the remaining activity pages on demand before showing the oldest
+page. If an activity changes state while paging, the dashboard safely reloads
+from the newest page instead of silently skipping history.
+
 A transaction with shielded actions has a **Decrypt actions** button on its
 **Ironwood actions** row. It shows what this environment's wallet recorded
 about the transaction for accounts 1–5, below that row. It is local wallet
