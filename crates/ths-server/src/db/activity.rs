@@ -1,5 +1,6 @@
 use super::address_faucet::address_for_key;
 use super::*;
+use std::collections::HashMap;
 
 /// Qualified so it also reads unambiguously in joins. The order must match `row_activity`.
 const ACTIVITY_COLUMNS: &str = "a.id,a.kind,a.from_account,a.to_account,a.to_address,a.source_pool,a.destination_pool,a.amount_zatoshi,a.txid,a.block_hash,a.status,a.created_at,a.last_error";
@@ -80,6 +81,32 @@ impl Store {
 
     pub(crate) fn all_activities(&self) -> Result<Vec<Activity>> {
         self.activities_with_limit(-1)
+    }
+
+    /// Returns a permanent order for every visible activity. Callers pass the
+    /// current newest-first view; identities not seen before are recorded from
+    /// oldest to newest so their relative order is retained on later reads.
+    pub(crate) fn activity_sequences(
+        &self,
+        newest_first: &[String],
+    ) -> Result<HashMap<String, i64>> {
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction()?;
+        {
+            let mut insert =
+                tx.prepare("INSERT OR IGNORE INTO activity_order(activity_id) VALUES(?1)")?;
+            for id in newest_first.iter().rev() {
+                insert.execute([id])?;
+            }
+        }
+        let sequences = {
+            let mut query = tx.prepare("SELECT activity_id,sequence FROM activity_order")?;
+            query
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<HashMap<_, _>>>()?
+        };
+        tx.commit()?;
+        Ok(sequences)
     }
 
     fn activities_with_limit(&self, limit: i64) -> Result<Vec<Activity>> {
@@ -337,6 +364,10 @@ impl Store {
 
 fn insert_activity(db: &Connection, a: &Activity, key: &str, memo: Option<&str>) -> Result<()> {
     db.execute("INSERT INTO activity(id,kind,from_account,to_account,to_address,source_pool,destination_pool,amount_zatoshi,txid,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![a.id,a.kind,a.from_account,a.to_account,a.to_address,a.source_pool,a.destination_pool,a.amount_zatoshi,a.txid,a.status])?;
+    db.execute(
+        "INSERT OR IGNORE INTO activity_order(activity_id) VALUES(?1)",
+        [&a.id],
+    )?;
     db.execute(
         "INSERT INTO idempotency(key,activity_id,memo) VALUES(?1,?2,?3)",
         params![key, a.id, memo],

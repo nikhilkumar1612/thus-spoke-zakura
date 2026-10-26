@@ -536,6 +536,20 @@ fn unified_activity_with_prepared(
     activity
 }
 
+fn order_activity_by_first_seen(
+    activity: &mut [ActivityEntry],
+    sequences: &HashMap<String, i64>,
+) -> anyhow::Result<()> {
+    if let Some(entry) = activity
+        .iter()
+        .find(|entry| !sequences.contains_key(&entry.id))
+    {
+        anyhow::bail!("activity {} has no first-seen sequence", entry.id);
+    }
+    activity.sort_by(|left, right| sequences[&right.id].cmp(&sequences[&left.id]));
+    Ok(())
+}
+
 const ACTIVITY_KINDS: [&str; 3] = ["send", "faucet", "transaction"];
 const ACTIVITY_STATUSES: [&str; 7] = [
     "preparing",
@@ -631,10 +645,14 @@ pub(crate) async fn activity(
     let (mut canonical, prepared_txids) =
         state.0.wallet.canonical_activity(None, journal_ids).await?;
     enrich_external_source_pools(&state, &mut canonical).await;
-    let (entries, has_more) = activity_page(
-        unified_activity_with_prepared(journal, canonical, &prepared_txids),
-        &page,
-    )?;
+    let mut activity = unified_activity_with_prepared(journal, canonical, &prepared_txids);
+    let activity_ids = activity
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect::<Vec<_>>();
+    let sequences = state.0.store.activity_sequences(&activity_ids)?;
+    order_activity_by_first_seen(&mut activity, &sequences)?;
+    let (entries, has_more) = activity_page(activity, &page)?;
     let mut response = Json(entries).into_response();
     response.headers_mut().insert(
         "x-ths-has-more",

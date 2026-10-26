@@ -88,6 +88,15 @@ fn page(
     }
 }
 
+fn persist_first_seen_order(store: &crate::db::Store, activity: &mut [ActivityEntry]) {
+    let ids = activity
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect::<Vec<_>>();
+    let sequences = store.activity_sequences(&ids).unwrap();
+    order_activity_by_first_seen(activity, &sequences).unwrap();
+}
+
 fn transparent_receive(receiver: &str) -> Transaction {
     let Address::Transparent(receiver) = Address::decode(&regtest_network(), receiver).unwrap()
     else {
@@ -451,6 +460,82 @@ fn activity_id_cursor_is_stable_when_newer_activity_arrives() {
             .collect::<Vec<_>>(),
         ["c", "d"]
     );
+}
+
+#[test]
+fn confirming_an_activity_between_pages_does_not_repeat_it() {
+    let store = crate::db::Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let x = journal_entry("x", "preparing", "2026-10-15 10:03:00");
+    let y = journal_entry("y", "preparing", "2026-10-15 10:02:00");
+    let older = canonical_activity("incoming", "older");
+    let mut first_view = unified_activity_with_prepared(
+        vec![x.clone(), y.clone()],
+        vec![older.clone()],
+        &HashMap::new(),
+    );
+    persist_first_seen_order(&store, &mut first_view);
+    let first_page = page_activity(first_view, &page(Some(2), None, None, None, None)).unwrap();
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        ["x", "y"]
+    );
+
+    let mut confirmed_x = x;
+    confirmed_x.status = "confirmed".to_owned();
+    confirmed_x.txid = "confirmed-x".to_owned();
+    let confirmed_x_wallet = canonical_activity("internal", "confirmed-x");
+    let mut second_view = unified_activity_with_prepared(
+        vec![confirmed_x, y],
+        vec![confirmed_x_wallet, older],
+        &HashMap::new(),
+    );
+    persist_first_seen_order(&store, &mut second_view);
+    let second_page =
+        page_activity(second_view, &page(Some(2), None, None, None, Some("y"))).unwrap();
+
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].id, "wallet:older");
+}
+
+#[test]
+fn unmining_an_activity_between_pages_does_not_skip_it() {
+    let store = crate::db::Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let x = journal_entry("x", "preparing", "2026-10-15 10:03:00");
+    let y = journal_entry("y", "preparing", "2026-10-15 10:02:00");
+    let mut rollback = canonical_activity("incoming", "rollback");
+    rollback.created_at = Some("2026-10-15 10:04:00".to_owned());
+    let mut first_view = unified_activity_with_prepared(
+        vec![x.clone(), y.clone()],
+        vec![rollback.clone()],
+        &HashMap::new(),
+    );
+    persist_first_seen_order(&store, &mut first_view);
+    let first_page = page_activity(first_view, &page(Some(2), None, None, None, None)).unwrap();
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        ["x", "y"]
+    );
+
+    rollback.mined_height = None;
+    rollback.tx_index = None;
+    rollback.block_hash = None;
+    rollback.confirmations = 0;
+    let mut second_view =
+        unified_activity_with_prepared(vec![x, y], vec![rollback], &HashMap::new());
+    persist_first_seen_order(&store, &mut second_view);
+    let second_page =
+        page_activity(second_view, &page(Some(2), None, None, None, Some("y"))).unwrap();
+
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].id, "wallet:rollback");
 }
 
 #[test]
@@ -1096,14 +1181,14 @@ async fn activity_lookup_by_key_returns_every_state_regardless_of_list_limits() 
     assert_eq!(
         listed,
         [
-            (json!(failed.id), json!("failed"), json!("")),
-            (json!(pending.id), json!("broadcast"), json!("pending-txid")),
-            (json!(preparing.id), json!("preparing"), json!("")),
             (
                 json!(confirmed.id),
                 json!("confirmed"),
                 json!("confirmed-txid")
             ),
+            (json!(failed.id), json!("failed"), json!("")),
+            (json!(pending.id), json!("broadcast"), json!("pending-txid")),
+            (json!(preparing.id), json!("preparing"), json!("")),
         ]
     );
 
