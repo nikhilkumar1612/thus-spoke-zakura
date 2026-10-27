@@ -178,8 +178,15 @@ When a transaction uses more than one pool, `source_pool` or
 
 For external incoming transactions, transparent-source detection requires a
 Zakura transaction lookup. These lookups run concurrently within one short,
-shared budget and fail open: if Zakura is slow or unavailable, activity still
-returns and the unknown source pool remains absent.
+shared budget after filtering and pagination, so only entries in the returned
+page are enriched. They fail open: if Zakura is slow or unavailable, activity
+still returns and the unknown source pool remains absent.
+
+Activity listing also separates page selection from wallet-detail loading. It
+first combines lightweight journal and wallet identities, applies filters and
+the stable first-seen cursor, and selects `limit + 1` candidates. The extra
+candidate determines whether another page exists; full amounts, memos, pools,
+and recipients are loaded only for the `limit` entries returned to the client.
 
 For the keyed payment-journal object, read `txid`, `status`, and `block_hash`
 first; do not infer confirmation merely because HTTP returned 200. That object

@@ -63,6 +63,16 @@ fn canonical_activity(direction: &'static str, txid: &str) -> CanonicalActivity 
     }
 }
 
+fn canonical_index(txid: &str, account: u8) -> CanonicalActivityIndex {
+    CanonicalActivityIndex {
+        txid: txid.to_owned(),
+        mined_height: Some(120),
+        tx_index: Some(0),
+        affected_accounts: vec![account],
+        created_at: None,
+    }
+}
+
 fn journal_entry(id: &str, status: &str, created_at: &str) -> Activity {
     let mut activity = journal_send("");
     activity.id = id.to_owned();
@@ -324,16 +334,16 @@ fn transparent_inputs_are_reported_as_a_public_source_pool() {
     incoming.from_accounts.clear();
     incoming.source_pools.clear();
 
+    let mut activity = ActivityEntry::canonical(incoming);
     add_public_source_pools(
-        &mut incoming,
+        &mut activity,
         &serde_json::json!({
             "vin": [{"txid": "previous-transaction", "vout": 0}]
         }),
     );
 
-    let activity = unified_activity(Vec::new(), vec![incoming], 30);
-    assert_eq!(activity[0].source_pool.as_deref(), Some("transparent"));
-    assert_eq!(activity[0].source_pools, ["transparent"]);
+    assert_eq!(activity.source_pool.as_deref(), Some("transparent"));
+    assert_eq!(activity.source_pools, ["transparent"]);
 }
 
 #[test]
@@ -343,14 +353,14 @@ fn coinbase_does_not_look_like_a_transparent_payment_source() {
     incoming.from_accounts.clear();
     incoming.source_pools.clear();
 
+    let mut activity = ActivityEntry::canonical(incoming);
     add_public_source_pools(
-        &mut incoming,
+        &mut activity,
         &serde_json::json!({"vin": [{"coinbase": "00"}]}),
     );
 
-    let activity = unified_activity(Vec::new(), vec![incoming], 30);
-    assert_eq!(activity[0].source_pool, None);
-    assert!(activity[0].source_pools.is_empty());
+    assert_eq!(activity.source_pool, None);
+    assert!(activity.source_pools.is_empty());
 }
 
 #[test]
@@ -619,7 +629,7 @@ async fn stalled_node_uses_one_bounded_enrichment_budget() {
             activity.from_account = None;
             activity.from_accounts.clear();
             activity.source_pools.clear();
-            activity
+            ActivityEntry::canonical(activity)
         })
         .collect::<Vec<_>>();
 
@@ -634,6 +644,72 @@ async fn stalled_node_uses_one_bounded_enrichment_budget() {
             .iter()
             .all(|activity| activity.source_pools.is_empty())
     );
+}
+
+#[tokio::test]
+async fn source_pool_enrichment_is_limited_to_the_returned_page() {
+    async fn rpc_response(
+        State(requests): State<Arc<AtomicUsize>>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        requests.fetch_add(1, Ordering::Relaxed);
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"vin": []},
+            "error": null
+        }))
+    }
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rpc = NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+    let app = axum::Router::new()
+        .route("/", axum::routing::post(rpc_response))
+        .with_state(requests.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let activity = (0..11)
+        .map(|index| {
+            let mut activity = canonical_activity("incoming", &format!("incoming-{index}"));
+            activity.from_account = None;
+            activity.from_accounts.clear();
+            activity.source_pools.clear();
+            ActivityEntry::canonical(activity)
+        })
+        .collect::<Vec<_>>();
+
+    let (entries, has_more) = enriched_activity_page(
+        &rpc,
+        activity,
+        &page(Some(3), None, None, None, None),
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(entries.len(), 3);
+    assert!(has_more);
+    assert_eq!(requests.load(Ordering::Relaxed), 3);
+    server.abort();
+}
+
+#[test]
+fn full_wallet_details_are_selected_only_for_the_returned_page() {
+    let canonical = (0..25)
+        .map(|index| canonical_index(&format!("tx-{index}"), 1))
+        .collect::<Vec<_>>();
+    let candidates = activity_candidates(Vec::new(), canonical, &HashMap::new());
+
+    let (selected, has_more) =
+        candidate_page(candidates, &page(Some(10), None, None, None, None)).unwrap();
+    let selected_txids = selected
+        .iter()
+        .filter_map(|entry| entry.canonical_txid.as_deref())
+        .collect::<Vec<_>>();
+
+    assert!(has_more);
+    assert_eq!(selected.len(), 10);
+    assert_eq!(selected_txids.len(), 10);
 }
 
 #[tokio::test]
@@ -946,7 +1022,7 @@ fn settlement_waits_for_startup_after_the_components_agree() {
 use crate::state::tests::{api_get, counting_rpc};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 fn lightwalletd_probe(

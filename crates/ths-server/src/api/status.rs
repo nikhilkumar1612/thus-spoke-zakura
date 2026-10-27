@@ -5,7 +5,7 @@ use crate::{
     db::{Account, Activity, USER_ACCOUNT_COUNT},
     rpc::{ChainCheckpoint, ChainInfo, NodeRpc},
     state::{WalletSyncStatus, wallet_matches_tip},
-    wallet::CanonicalActivity,
+    wallet::{CanonicalActivity, CanonicalActivityIndex},
 };
 use axum::{
     Json,
@@ -249,6 +249,19 @@ pub(crate) struct ActivityEntry {
     last_error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct ActivityCandidate {
+    id: String,
+    kind: String,
+    status: String,
+    affected_accounts: Vec<u8>,
+    mined_height: Option<u32>,
+    tx_index: Option<u32>,
+    created_at: Option<String>,
+    journal: Option<Activity>,
+    canonical_txid: Option<String>,
+}
+
 fn visible_account(account: Option<u8>) -> Option<u8> {
     account.filter(|id| *id <= USER_ACCOUNT_COUNT)
 }
@@ -401,7 +414,7 @@ impl ActivityEntry {
     }
 }
 
-fn add_public_source_pools(activity: &mut CanonicalActivity, transaction: &Value) {
+fn add_public_source_pools(activity: &mut ActivityEntry, transaction: &Value) {
     let has_transparent_inputs = transaction
         .get("vin")
         .and_then(Value::as_array)
@@ -419,16 +432,14 @@ fn add_public_source_pools(activity: &mut CanonicalActivity, transaction: &Value
     {
         activity.source_pools.push("transparent".to_owned());
         activity.source_pools.sort();
+        activity.source_pool =
+            (activity.source_pools.len() == 1).then(|| activity.source_pools[0].clone());
     }
-}
-
-async fn enrich_external_source_pools(state: &AppState, activity: &mut [CanonicalActivity]) {
-    enrich_external_source_pools_within(&state.0.rpc, activity, Duration::from_secs(2)).await;
 }
 
 async fn enrich_external_source_pools_within(
     rpc: &NodeRpc,
-    activity: &mut [CanonicalActivity],
+    activity: &mut [ActivityEntry],
     budget: Duration,
 ) {
     const CONCURRENCY: usize = 8;
@@ -436,7 +447,9 @@ async fn enrich_external_source_pools_within(
     let requests = activity
         .iter_mut()
         .enumerate()
-        .filter(|(_, entry)| entry.direction == "incoming")
+        // Journal faucet rows already carry their known source pool. Only
+        // canonical incoming transactions can need public-input discovery.
+        .filter(|(_, entry)| entry.kind == "transaction" && entry.direction == "incoming")
         .map(|(index, entry)| (index, entry.txid.clone()))
         .collect::<Vec<_>>();
     let mut responses = stream::iter(requests)
@@ -474,6 +487,7 @@ fn unified_activity(
     activity
 }
 
+#[cfg(test)]
 fn unified_activity_with_prepared(
     journal: Vec<Activity>,
     canonical: Vec<CanonicalActivity>,
@@ -536,8 +550,110 @@ fn unified_activity_with_prepared(
     activity
 }
 
+#[cfg(test)]
 fn order_activity_by_first_seen(
     activity: &mut [ActivityEntry],
+    sequences: &HashMap<String, i64>,
+) -> anyhow::Result<()> {
+    if let Some(entry) = activity
+        .iter()
+        .find(|entry| !sequences.contains_key(&entry.id))
+    {
+        anyhow::bail!("activity {} has no first-seen sequence", entry.id);
+    }
+    activity.sort_by(|left, right| sequences[&right.id].cmp(&sequences[&left.id]));
+    Ok(())
+}
+
+fn activity_candidates(
+    journal: Vec<Activity>,
+    canonical: Vec<CanonicalActivityIndex>,
+    prepared_txids: &HashMap<String, String>,
+) -> Vec<ActivityCandidate> {
+    let mut canonical = canonical
+        .into_iter()
+        .map(|entry| (entry.txid.clone(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut candidates = Vec::new();
+    for mut journal in journal {
+        if let Some(prepared_txid) = prepared_txids.get(&journal.id) {
+            journal.txid.clone_from(prepared_txid);
+        }
+        let canonical = (!journal.txid.is_empty())
+            .then(|| canonical.remove(&journal.txid))
+            .flatten();
+        let mut affected_accounts = canonical
+            .as_ref()
+            .map(|entry| entry.affected_accounts.clone())
+            .unwrap_or_default();
+        for account in [journal.from_account, journal.to_account]
+            .into_iter()
+            .flatten()
+            .filter(|account| *account <= USER_ACCOUNT_COUNT)
+        {
+            if !affected_accounts.contains(&account) {
+                affected_accounts.push(account);
+            }
+        }
+        affected_accounts.sort_unstable();
+        let mined_height = canonical.as_ref().and_then(|entry| entry.mined_height);
+        let tx_index = canonical.as_ref().and_then(|entry| entry.tx_index);
+        let canonical_txid = canonical.as_ref().map(|entry| entry.txid.clone());
+        candidates.push(ActivityCandidate {
+            id: journal.id.clone(),
+            kind: journal.kind.clone(),
+            status: if mined_height.is_some() {
+                "confirmed".to_owned()
+            } else {
+                journal.status.clone()
+            },
+            affected_accounts,
+            mined_height,
+            tx_index,
+            created_at: Some(journal.created_at.clone()),
+            journal: Some(journal),
+            canonical_txid,
+        });
+    }
+    candidates.extend(canonical.into_values().map(|entry| {
+        ActivityCandidate {
+            id: format!("wallet:{}", entry.txid),
+            kind: "transaction".to_owned(),
+            status: if entry.mined_height.is_some() {
+                "confirmed"
+            } else {
+                "pending"
+            }
+            .to_owned(),
+            affected_accounts: entry.affected_accounts,
+            mined_height: entry.mined_height,
+            tx_index: entry.tx_index,
+            created_at: entry.created_at,
+            journal: None,
+            canonical_txid: Some(entry.txid),
+        }
+    }));
+    candidates.sort_by(|left, right| {
+        let group = |entry: &ActivityCandidate| match (entry.mined_height, entry.status.as_str()) {
+            (None, "confirmed") => 2,
+            (None, _) => 0,
+            (Some(_), _) => 1,
+        };
+        match group(left).cmp(&group(right)) {
+            std::cmp::Ordering::Equal => match (left.mined_height, right.mined_height) {
+                (Some(left_height), Some(right_height)) => right_height
+                    .cmp(&left_height)
+                    .then_with(|| right.tx_index.cmp(&left.tx_index)),
+                _ => right.created_at.cmp(&left.created_at),
+            },
+            order => order,
+        }
+    });
+    candidates
+}
+
+fn order_candidates_by_first_seen(
+    activity: &mut [ActivityCandidate],
     sequences: &HashMap<String, i64>,
 ) -> anyhow::Result<()> {
     if let Some(entry) = activity
@@ -561,10 +677,7 @@ const ACTIVITY_STATUSES: [&str; 7] = [
     "failed",
 ];
 
-fn activity_page(
-    mut activity: Vec<ActivityEntry>,
-    page: &Page,
-) -> ApiResult<(Vec<ActivityEntry>, bool)> {
+fn validate_activity_page(page: &Page) -> ApiResult<()> {
     if let Some(account) = page.account
         && !(1..=USER_ACCOUNT_COUNT).contains(&account)
     {
@@ -587,6 +700,15 @@ fn activity_page(
     if page.before.as_deref() == Some("") {
         return Err(ApiError::bad_request("before must not be empty"));
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn activity_page(
+    mut activity: Vec<ActivityEntry>,
+    page: &Page,
+) -> ApiResult<(Vec<ActivityEntry>, bool)> {
+    validate_activity_page(page)?;
 
     activity.retain(|entry| {
         page.account.is_none_or(|account| {
@@ -619,6 +741,87 @@ fn activity_page(
     Ok((entries, has_more))
 }
 
+fn candidate_page(
+    mut activity: Vec<ActivityCandidate>,
+    page: &Page,
+) -> ApiResult<(Vec<ActivityCandidate>, bool)> {
+    validate_activity_page(page)?;
+    activity.retain(|entry| {
+        page.account
+            .is_none_or(|account| entry.affected_accounts.contains(&account))
+            && page.kind.as_deref().is_none_or(|kind| entry.kind == kind)
+            && page
+                .status
+                .as_deref()
+                .is_none_or(|status| entry.status == status)
+    });
+    let start = match page.before.as_deref() {
+        Some(before) => activity
+            .iter()
+            .position(|entry| entry.id == before)
+            .map(|position| position + 1)
+            .ok_or_else(|| {
+                ApiError::conflict("activity cursor is stale; reload from the first page")
+            })?,
+        None => 0,
+    };
+    let limit = page.limit.unwrap_or(30).min(100) as usize;
+    let mut entries = activity
+        .into_iter()
+        .skip(start)
+        .take(limit + 1)
+        .collect::<Vec<_>>();
+    let has_more = entries.len() > limit;
+    entries.truncate(limit);
+    Ok((entries, has_more))
+}
+
+fn hydrate_candidates(
+    candidates: Vec<ActivityCandidate>,
+    canonical: Vec<CanonicalActivity>,
+) -> ApiResult<Vec<ActivityEntry>> {
+    let mut canonical = canonical
+        .into_iter()
+        .map(|entry| (entry.txid.clone(), entry))
+        .collect::<HashMap<_, _>>();
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            let hydrated = candidate
+                .canonical_txid
+                .as_ref()
+                .and_then(|txid| canonical.remove(txid));
+            match (candidate.journal, hydrated) {
+                (Some(journal), Some(canonical)) => {
+                    Ok(ActivityEntry::canonical(canonical).merge_journal(journal))
+                }
+                (Some(journal), None) if candidate.canonical_txid.is_none() => {
+                    Ok(ActivityEntry::journal(journal))
+                }
+                (None, Some(canonical)) => Ok(ActivityEntry::canonical(canonical)),
+                _ => Err(ApiError::conflict(
+                    "activity changed while the page was loading; reload from the first page",
+                )),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+async fn enriched_activity_page(
+    rpc: &NodeRpc,
+    activity: Vec<ActivityEntry>,
+    page: &Page,
+    budget: Duration,
+) -> ApiResult<(Vec<ActivityEntry>, bool)> {
+    let (mut entries, has_more) = activity_page(activity, page)?;
+    // External transparent-source discovery needs a Zakura RPC per incoming
+    // transaction. It does not affect filtering or ordering, so keep that
+    // network work proportional to the page the caller will actually receive.
+    enrich_external_source_pools_within(rpc, &mut entries, budget).await;
+    Ok((entries, has_more))
+}
+
 #[cfg(test)]
 fn page_activity(activity: Vec<ActivityEntry>, page: &Page) -> ApiResult<Vec<ActivityEntry>> {
     activity_page(activity, page).map(|(entries, _)| entries)
@@ -642,17 +845,26 @@ pub(crate) async fn activity(
     }
     let journal = state.0.store.all_activities()?;
     let journal_ids = journal.iter().map(|entry| entry.id.clone()).collect();
-    let (mut canonical, prepared_txids) =
-        state.0.wallet.canonical_activity(None, journal_ids).await?;
-    enrich_external_source_pools(&state, &mut canonical).await;
-    let mut activity = unified_activity_with_prepared(journal, canonical, &prepared_txids);
-    let activity_ids = activity
+    let (canonical, prepared_txids) = state.0.wallet.canonical_activity_index(journal_ids).await?;
+    let mut candidates = activity_candidates(journal, canonical, &prepared_txids);
+    let activity_ids = candidates
         .iter()
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
     let sequences = state.0.store.activity_sequences(&activity_ids)?;
-    order_activity_by_first_seen(&mut activity, &sequences)?;
-    let (entries, has_more) = activity_page(activity, &page)?;
+    order_candidates_by_first_seen(&mut candidates, &sequences)?;
+    let (candidates, has_more) = candidate_page(candidates, &page)?;
+    let txids = candidates
+        .iter()
+        .filter_map(|entry| entry.canonical_txid.clone())
+        .collect::<HashSet<_>>();
+    let canonical = if txids.is_empty() {
+        Vec::new()
+    } else {
+        state.0.wallet.canonical_activity_by_txids(txids).await?
+    };
+    let mut entries = hydrate_candidates(candidates, canonical)?;
+    enrich_external_source_pools_within(&state.0.rpc, &mut entries, Duration::from_secs(2)).await;
     let mut response = Json(entries).into_response();
     response.headers_mut().insert(
         "x-ths-has-more",

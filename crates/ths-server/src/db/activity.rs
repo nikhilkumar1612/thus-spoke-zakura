@@ -91,20 +91,30 @@ impl Store {
         newest_first: &[String],
     ) -> Result<HashMap<String, i64>> {
         let mut db = self.0.lock().unwrap();
-        let tx = db.transaction()?;
-        {
-            let mut insert =
-                tx.prepare("INSERT OR IGNORE INTO activity_order(activity_id) VALUES(?1)")?;
-            for id in newest_first.iter().rev() {
-                insert.execute([id])?;
-            }
-        }
-        let sequences = {
-            let mut query = tx.prepare("SELECT activity_id,sequence FROM activity_order")?;
+        let mut sequences = {
+            let mut query = db.prepare("SELECT activity_id,sequence FROM activity_order")?;
             query
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<rusqlite::Result<HashMap<_, _>>>()?
         };
+        let unseen = newest_first
+            .iter()
+            .rev()
+            .filter(|id| !sequences.contains_key(*id))
+            .collect::<Vec<_>>();
+        if unseen.is_empty() {
+            return Ok(sequences);
+        }
+
+        let tx = db.transaction()?;
+        {
+            let mut insert =
+                tx.prepare("INSERT OR IGNORE INTO activity_order(activity_id) VALUES(?1)")?;
+            for id in unseen {
+                insert.execute([id])?;
+                sequences.insert(id.clone(), tx.last_insert_rowid());
+            }
+        }
         tx.commit()?;
         Ok(sequences)
     }
